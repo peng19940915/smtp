@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/smtp"
 	"strings"
+
 )
 
 type Smtp struct {
@@ -39,6 +40,7 @@ func NewSMTP(address, username, password string, tls, anonymous, skipVerify bool
 }
 
 func (this *Smtp) SendMail(from, tos, subject, body string, contentType ...string) error {
+	var preferred_auths = [] string{"LOGIN", "PLAIN", "CRAM-MD5"}
 	if this.Address == "" {
 		return fmt.Errorf("address is necessary")
 	}
@@ -87,107 +89,59 @@ func (this *Smtp) SendMail(from, tos, subject, body string, contentType ...strin
 	message += "\r\n" + b64.EncodeToString([]byte(body))
 
 	var auth smtp.Auth = nil
-	if !this.Anonymous {
-		auth = smtp.PlainAuth("", this.Username, this.Password, hp[0])
-	}
-	if this.TLS {
-		return sendMailByTLS(this.Address, auth, from, strings.Split(tos, ";"), []byte(message), this.SkipVerify)
-	} else {
-		return sendMail(this.Address, auth, from, strings.Split(tos, ";"), []byte(message), this.SkipVerify)
-	}
-}
-
-func sendMail(addr string, a smtp.Auth, from string, to []string, msg []byte, skipVerify bool) error {
-	if err := validateLine(from); err != nil {
-		return err
-	}
-	for _, recp := range to {
-		if err := validateLine(recp); err != nil {
-			return err
-		}
-	}
-
-	hp := strings.Split(addr, ":")
-	if len(hp) != 2 {
-		return fmt.Errorf("address format error")
-	}
-	c, err := smtp.Dial(addr)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		config := &tls.Config{
-			InsecureSkipVerify: skipVerify,
-			ServerName:         hp[0],
-		}
-		if err = c.StartTLS(config); err != nil {
-			return err
-		}
-	}
-	if a != nil {
-		if err = c.Auth(a); err != nil {
-			return err
-		}
-	}
-	if err = c.Mail(from); err != nil {
-		return err
-	}
-	for _, addr := range to {
-		if err = c.Rcpt(addr); err != nil {
-			return err
-		}
-	}
-	w, err := c.Data()
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(msg)
-	if err != nil {
-		return err
-	}
-	err = w.Close()
-	if err != nil {
-		return err
-	}
-	return c.Quit()
-}
-
-func sendMailByTLS(addr string, a smtp.Auth, from string, to []string, msg []byte, skipVerify bool) error {
-	if err := validateLine(from); err != nil {
-		return err
-	}
-	for _, recp := range to {
-		if err := validateLine(recp); err != nil {
-			return err
-		}
-	}
-	hp := strings.Split(addr, ":")
-	if len(hp) != 2 {
-		return fmt.Errorf("address format error")
-	}
-
 	tlsconfig := &tls.Config{
-		InsecureSkipVerify: skipVerify,
+		InsecureSkipVerify: this.SkipVerify,
 		ServerName:         hp[0],
 	}
+	var loginSuccess = false
+	// 修改login方式
+	var c *smtp.Client
+	var err error
+	for _, method := range preferred_auths{
+		switch method {
+		case "PLAIN":
+			auth = smtp.PlainAuth("", this.Username, this.Password, hp[0])
+		case "CRAM-MD5":
+			auth = smtp.CRAMMD5Auth(this.Username, this.Password)
+		case "LOGIN":
+			auth = &loginAuth{username: this.Username, password: this.Password, host: hp[0]}
+		}
+		// 生成connection
+		c, err = smtp.Dial(this.Address)
+		if this.TLS {
+			if err = c.StartTLS(tlsconfig); err != nil {
+				return err
+			}
+		}
+		// 如果登陆失败
+		if err = c.Auth(auth); err != nil {
+			continue
+		}else {
+			loginSuccess = true
+			break
+		}
 
-	conn, err := tls.Dial("tcp", addr, tlsconfig)
+	}
+	if loginSuccess {
+		return sendMail(c, from, strings.Split(tos, ";"), []byte(message), this.SkipVerify)
+	}else {
+		return fmt.Errorf("Login failed: %v", err.Error())
+	}
 
-	if err != nil {
+}
+
+func sendMail(c *smtp.Client, from string, to []string, msg []byte, skipVerify bool) error {
+	var err error
+	if err = validateLine(from); err != nil {
 		return err
 	}
-	c, err := smtp.NewClient(conn, hp[0])
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	if a != nil {
-		if err = c.Auth(a); err != nil {
+	for _, recp := range to {
+		if err := validateLine(recp); err != nil {
 			return err
 		}
 	}
+
+	defer c.Close()
 	if err = c.Mail(from); err != nil {
 		return err
 	}
